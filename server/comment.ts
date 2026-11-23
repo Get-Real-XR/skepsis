@@ -6,6 +6,7 @@
  * Copyright Oxide Computer Company
  */
 
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { commentSyntaxAt, getCommentSyntax } from './commentSyntax.ts'
@@ -37,10 +38,14 @@ export async function insertComment(
   text: string,
   lineCount = 1,
   quote?: string,
+  contentHash?: string,
 ): Promise<void> {
   await assertNotSymlink(cwd, file)
   const filePath = join(cwd, file)
   const content = await readFile(filePath, 'utf-8')
+  if (contentHash && createHash('sha256').update(content).digest('hex') !== contentHash) {
+    throw new Error('The file changed on disk. Refresh and anchor the comment again.')
+  }
   const lines = content.split('\n')
 
   if (afterLine < 1 || afterLine > lines.length) {

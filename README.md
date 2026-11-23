@@ -105,10 +105,16 @@ skepsis                          # review branch vs trunk, GitHub PR style
 skepsis -r @                     # review working copy only
 skepsis -r 'mybranch..@'         # review a range
 skepsis -f main -t @             # diff between two revisions
+skepsis --revset 'main..@'       # filter the Revisions graph; leave the opening diff unchanged
 skepsis --interdiff -f mybranch@origin -t mybranch
                                  # review changes to a commit since push
                                  # (jj interdiff)
 ```
+
+Open **Revisions** in the toolbar to inspect the Jujutsu graph. Enter a revset
+to filter the graph, select a change to review what it introduced, or pick
+**From** and **To** to compare two revisions. Choose `@` as **To** to review and
+leave comments in the working copy.
 
 In jj repos, `--interdiff` (used with `-f`, `-t`, or both) runs `jj interdiff`,
 rebasing the `--from` revision onto the `--to` revision's parents before
@@ -151,6 +157,18 @@ The npm package ships compiled CLI/server JavaScript plus a prebuilt frontend
 bundle, so installing or running with `npx` does not build anything. In dev
 mode (`--dev`), a Vite dev server runs alongside the API server with hot
 reload from a source checkout.
+
+### Difftastic previews
+
+Toggle **Difftastic** in the review toolbar for syntax-aware diffs. Skepsis runs
+`difft` from the server's `PATH` as you scroll through files. The default
+presentation gives additions and removals their own columns when a hunk contains
+both, and uses one column for a hunk that changes only one side. The preview
+honors the Difftastic display, context and tab-width settings in the Jujutsu
+formatter arguments or the server environment. Lines wrap to fit the browser.
+
+Use a line's plus button or select text to leave a comment. Select **Show full
+file** to reach a line outside the displayed context.
 
 ### Comments
 

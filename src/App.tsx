@@ -45,19 +45,30 @@ import type {
   LineAnnotation,
   SelectedLineRange,
 } from '@pierre/diffs'
-import { THEME_MODES, TOKEN_HEADER } from '../shared/types.ts'
+import { REVIEW_REVISION_PARAMS, THEME_MODES, TOKEN_HEADER } from '../shared/types.ts'
+import {
+  RevisionPicker,
+  reviewLocationKey,
+  subscribeToReviewLocation,
+} from './RevisionPicker.tsx'
+import { RangeChangeList } from './RangeChangeList.tsx'
 import { mergeDuplicateFiles } from './diffFiles.ts'
 import type {
   CommentRequest,
   DiffHashResponse,
   DiffResponse,
+  RevisionComparison,
+  RangeReviewProgress,
   SendRequest,
   ErrorResponse,
   FileContentsResponse,
+  DifftasticLine,
+  DifftasticResponse,
   ThemeMode,
   ThemeResponse,
   ViewedMap,
   FileHashes,
+  RevisionGraph,
 } from '../shared/types.ts'
 import {
   BARE_REVIEW_CLOSE_PATTERN,
@@ -73,15 +84,15 @@ import { diffChanges, type FileChange } from './diffChanges.ts'
 import { lineText as diffLineText, relocateLine } from './lineAnchor.ts'
 import { closeLine, openLineAt, selectionAnchor, textRange } from './textSelection.ts'
 
-const queryClient = new QueryClient({
+const queryClientOptions = {
   defaultOptions: {
     queries: {
       // React Query's default of three retries, except for a missing token,
       // which no retry fixes.
-      retry: (failures, error) => !isTokenError(error) && failures < 3,
+      retry: (failures: number, error: Error) => !isTokenError(error) && failures < 3,
     },
   },
-})
+}
 
 // Always the dual theme: the highlighter tokenizes both up front and switching
 // themes is purely a CSS flip (a single theme would retokenize on every
@@ -182,13 +193,20 @@ const isTokenError = (error: unknown) => error instanceof ApiError && error.stat
  *  which works wherever an application mounts the page. */
 async function apiFetch<T = unknown>(
   url: string,
-  opts: { method: string; body?: unknown } = { method: 'GET' },
+  opts: { method: string; body?: unknown; signal?: AbortSignal } = { method: 'GET' },
+  selection = new URLSearchParams(window.location.search),
 ): Promise<T> {
   const headers: Record<string, string> = {}
   if (token) headers[TOKEN_HEADER] = token
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json'
-  const res = await fetch(url, {
+  const requestUrl = new URL(url, document.baseURI)
+  for (const key of REVIEW_REVISION_PARAMS) {
+    const value = selection.get(key)
+    if (value !== null) requestUrl.searchParams.set(key, value)
+  }
+  const res = await fetch(requestUrl, {
     method: opts.method,
+    signal: opts.signal,
     headers,
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   })
@@ -198,6 +216,12 @@ async function apiFetch<T = unknown>(
   }
   return res.json() as Promise<T>
 }
+
+const fetchRevisionGraph = (revset: string) =>
+  apiFetch<RevisionGraph>('api/revisions?' + new URLSearchParams({ revset }))
+
+const fetchRangeProgress = (selection: URLSearchParams, signal: AbortSignal) =>
+  apiFetch<RangeReviewProgress>('api/range-changes', { method: 'GET', signal }, selection)
 
 // Wide enough for split diffs
 const wideQuery = '(min-width: 1060px)'
@@ -1313,6 +1337,11 @@ function ProgressBar({
   resolvedTheme,
   onToggleTheme,
   onShowHelp,
+  difftastic,
+  onToggleDifftastic,
+  showRevisions,
+  comparison,
+  changeListAvailable,
 }: {
   treeOpen: boolean
   onToggleTree: () => void
@@ -1323,6 +1352,11 @@ function ProgressBar({
   resolvedTheme: 'light' | 'dark'
   onToggleTheme: () => void
   onShowHelp: () => void
+  difftastic: boolean
+  onToggleDifftastic?: () => void
+  showRevisions: boolean
+  comparison?: RevisionComparison
+  changeListAvailable?: boolean
 }) {
   const total = Object.keys(fileHashes).length
   const viewedCount = Object.entries(fileHashes).filter(
@@ -1353,10 +1387,23 @@ function ProgressBar({
           <SidebarIcon open={treeOpen} />
         </button>
       </Tip>
-      {/* title gives a native tooltip when the command is ellipsized */}
-      <code className="diff-command" title={command}>
-        {command}
-      </code>
+      {showRevisions ? (
+        <RevisionPicker
+          fetchGraph={fetchRevisionGraph}
+          command={command}
+          comparison={comparison}
+        />
+      ) : (
+        <code className="diff-command" title={command}>
+          {command}
+        </code>
+      )}
+      {showRevisions && (
+        <RangeChangeList
+          available={changeListAvailable}
+          fetchProgress={fetchRangeProgress}
+        />
+      )}
       <div className="progress-track">
         <div
           className="progress-fill"
@@ -1378,6 +1425,16 @@ function ProgressBar({
           Clear
         </button>
       </Tip>
+      {onToggleDifftastic && (
+        <button
+          type="button"
+          className="difftastic-button"
+          aria-pressed={difftastic}
+          onClick={onToggleDifftastic}
+        >
+          Difftastic
+        </button>
+      )}
       {/* Two states in the UI over three in the model: the icon is the
           appearance currently on screen and pressing it flips to the other
           one. See toggleTheme for how that gets back to following the OS
@@ -1435,6 +1492,284 @@ function Modal({ onClose, children }: { onClose: () => void; children: React.Rea
       {children}
     </dialog>
   )
+}
+
+type StructuralAnchor = {
+  lineText: string
+  contentHash?: string
+  code?: SendRequest['code']
+}
+
+function difftasticSelection(pane: HTMLElement, lines: DifftasticLine[]) {
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return
+  const range = selection.getRangeAt(0)
+  const endpoint = (node: Node, offset: number) => {
+    const element = node instanceof Element ? node : node.parentElement
+    const code = element?.closest('.difftastic-line > code')
+    const row = code?.parentElement
+    if (!code || !row || !pane.contains(code)) return
+    const line = lines.find(
+      (candidate) =>
+        candidate.side === row.dataset['side'] &&
+        String(candidate.number) === row.dataset['lineNumber'],
+    )
+    if (!line) return
+    const prefix = document.createRange()
+    prefix.selectNodeContents(code)
+    prefix.setEnd(node, offset)
+    return { line, column: prefix.toString().length }
+  }
+  const start = endpoint(range.startContainer, range.startOffset)
+  const end = endpoint(range.endContainer, range.endOffset)
+  if (!start || !end || start.line.side !== end.line.side) return
+  const selected = lines.filter(
+    (line) =>
+      line.side === start.line.side &&
+      line.number >= start.line.number &&
+      line.number <= end.line.number,
+  )
+  if (selected.length !== end.line.number - start.line.number + 1) return
+  const quote = selected
+    .map((line) =>
+      line.text.slice(
+        line.number === start.line.number ? start.column : 0,
+        line.number === end.line.number ? end.column : undefined,
+      ),
+    )
+    .join('\n')
+  if (!quote) return
+  const whole = start.column === 0 && end.column === end.line.text.length
+  return {
+    first: start.line.number,
+    last: end.line,
+    text: {
+      columns: whole ? null : [start.column, end.column],
+      quote,
+      copy: selection.toString(),
+    } satisfies SelectedText,
+    code: [
+      {
+        lines: [start.line.number, end.line.number],
+        text: selected.map((line) => line.text).join('\n'),
+      },
+    ] satisfies SendRequest['code'],
+  }
+}
+
+function DifftasticText({ line }: { line: DifftasticLine }) {
+  const tokens = line.changes.map(({ start, end }, index) => {
+    const prefix = line.text.slice(line.changes[index - 1]?.end ?? 0, start)
+    return (
+      <Fragment key={start}>
+        {prefix}
+        <mark>{line.text.slice(start, end)}</mark>
+      </Fragment>
+    )
+  })
+  return (
+    <code>
+      {tokens}
+      {line.text.slice(line.changes.at(-1)?.end ?? 0)}
+    </code>
+  )
+}
+
+function DifftasticDiff({
+  item,
+  patchHash,
+  commentsEnabled,
+  send,
+  onComment,
+  renderAnnotation,
+}: {
+  item: CodeViewDiffItem<AnnotationMeta>
+  patchHash: string
+  commentsEnabled: boolean
+  send: boolean
+  onComment: (
+    line: DifftasticLine,
+    anchor: StructuralAnchor,
+    first?: number,
+    text?: SelectedText,
+  ) => void
+  renderAnnotation: (annotation: DiffLineAnnotation<AnnotationMeta>) => ReactElement | null
+}) {
+  const path = item.id
+  const oldPath = item.fileDiff.prevName
+  const ref = useRef<HTMLDivElement>(null)
+  const [inView, setInView] = useState(false)
+  const [full, setFull] = useState(false)
+  useEffect(() => {
+    const element = ref.current
+    if (inView || !element) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setInView(true)
+      },
+      { root: element.closest('.difftastic-pane'), rootMargin: '200px 0px' },
+    )
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [inView])
+
+  const { data, error, isPending } = useQuery({
+    queryKey: ['difftastic', path, oldPath, patchHash, full],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams({ path })
+      if (oldPath) params.set('oldPath', oldPath)
+      if (full) params.set('full', '1')
+      return apiFetch<DifftasticResponse>('api/difftastic?' + params.toString(), {
+        method: 'GET',
+        signal,
+      })
+    },
+    enabled: inView,
+    staleTime: Infinity,
+    retry: false,
+  })
+
+  const annotations = useMemo(() => {
+    const byLine = new Map<string, DiffLineAnnotation<AnnotationMeta>[]>()
+    for (const annotation of item.annotations ?? []) {
+      const meta = annotation.metadata
+      const number = meta?.type === 'sent' ? meta.sent.lines[1] : annotation.lineNumber
+      const id = annotation.side + ':' + number
+      const existing = byLine.get(id)
+      if (existing) existing.push(annotation)
+      else byLine.set(id, [annotation])
+    }
+    return byLine
+  }, [item.annotations])
+
+  function renderLine(index: number | null) {
+    if (index === null || !data) return null
+    const line = data.lines[index]!
+    const id = line.side + ':' + line.number
+    const contentHash =
+      line.side === 'additions' ? (data.newContentHash ?? undefined) : undefined
+    const canComment = send || (commentsEnabled && contentHash !== undefined)
+    const inReview = insideReview(item, line.side, line.number, line.number)
+    return (
+      <Fragment key={id}>
+        <div
+          className={'difftastic-line ' + line.kind}
+          data-side={line.side}
+          data-line-number={line.number}
+        >
+          <span className="difftastic-gutter">
+            {canComment && !inReview && (
+              <button
+                type="button"
+                aria-label={`Comment on ${line.side === 'deletions' ? 'old' : 'new'} line ${line.number}`}
+                className="difftastic-comment-button"
+                onClick={() => onComment(line, { lineText: line.text, contentHash })}
+              >
+                +
+              </button>
+            )}
+            {line.number}
+          </span>
+          <DifftasticText line={line} />
+        </div>
+        {annotations.get(id)?.map((annotation) => {
+          const meta = annotation.metadata
+          const key = meta?.type === 'sent' ? 'sent:' + meta.sent.id : meta?.type
+          return <Fragment key={key}>{renderAnnotation(annotation)}</Fragment>
+        })}
+      </Fragment>
+    )
+  }
+
+  return (
+    <div ref={ref} className="difftastic-file-body">
+      {inView && isPending && <p role="status">Comparing file versions…</p>}
+      {error && <p role="alert">{error.message}</p>}
+      {data && (
+        <>
+          <div className="difftastic-file-options">
+            <span>{data.language}</span>
+            {data.hasHiddenLines && (
+              <button
+                type="button"
+                className="difftastic-button"
+                onClick={() => setFull(true)}
+              >
+                Show full file
+              </button>
+            )}
+          </div>
+          {data.unchanged && !full && <p>No syntactic changes.</p>}
+          <div
+            className="difftastic-lines"
+            style={{ tabSize: data.tabWidth }}
+            onMouseUp={(event) => {
+              if (
+                event.button !== 0 ||
+                !(event.target instanceof Element) ||
+                !event.target.closest('.difftastic-line > code')
+              )
+                return
+              const picked = difftasticSelection(event.currentTarget, data.lines)
+              if (!picked) return
+              const { first, last, text, code } = picked
+              const contentHash =
+                last.side === 'additions' ? (data.newContentHash ?? undefined) : undefined
+              if (
+                (!send && !(commentsEnabled && contentHash)) ||
+                insideReview(item, last.side, first, last.number)
+              )
+                return
+              onComment(last, { lineText: last.text, contentHash, code }, first, text)
+            }}
+          >
+            {data.sections.map(({ layout, rows }, section) => (
+              <div
+                className="difftastic-section"
+                data-layout={layout}
+                key={rows[0]?.old ?? rows[0]?.new}
+              >
+                {section > 0 && (
+                  <div className="difftastic-gap" aria-hidden="true">
+                    …
+                  </div>
+                )}
+                {rows.map(({ old, new: updated }) =>
+                  layout === 'split' ? (
+                    <div className="difftastic-pair" key={old ?? updated}>
+                      <div>{renderLine(old)}</div>
+                      <div>{renderLine(updated)}</div>
+                    </div>
+                  ) : (
+                    <Fragment key={old ?? updated}>
+                      {renderLine(old)}
+                      {renderLine(updated)}
+                    </Fragment>
+                  ),
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function difftasticSection(pane: HTMLElement, id: string) {
+  return pane.querySelector<HTMLElement>('[data-difftastic-file="' + CSS.escape(id) + '"]')
+}
+
+function topDifftasticFile(pane: HTMLElement): string | undefined {
+  let first = 0
+  let last = pane.children.length - 1
+  while (first < last) {
+    const mid = Math.ceil((first + last) / 2)
+    const section = pane.children[mid] as HTMLElement
+    if (section.offsetTop <= pane.scrollTop + 4) first = mid
+    else last = mid - 1
+  }
+  return (pane.children[first] as HTMLElement | undefined)?.dataset['difftasticFile']
 }
 
 /** Keys, description, and whether the entry is only for --send */
@@ -1716,6 +2051,7 @@ function DiffView() {
     line: number
     diff: FileDiffMetadata
     text?: SelectedText
+    structural?: StructuralAnchor
     /** Counts opens, so a box reopened in place starts over */
     opened: number
   } | null>(null)
@@ -1745,6 +2081,7 @@ function DiffView() {
     // rarely fixes. Retrying would only hold off the error for several seconds.
     retry: false,
   })
+  const viewedFileHashes = data?.reviewHashes ?? data?.fileHashes
 
   // Ask whether the diff changed while the page is visible (React Query skips
   // the interval while the document is hidden, and refetches as soon as it's
@@ -1794,7 +2131,7 @@ function DiffView() {
     seededFromInitialLoad.current = true
     const generated = new Set(data.generated)
     setCollapsed((prev) => {
-      const seeded = Object.entries(data.fileHashes).filter(
+      const seeded = Object.entries(data.reviewHashes ?? data.fileHashes).filter(
         ([file, hash]) =>
           !(file in prev) &&
           (generated.has(file) || (firstLoad && data.viewed[file] === hash)),
@@ -1862,13 +2199,21 @@ function DiffView() {
         method: mark ? 'POST' : 'DELETE',
         body: { file, hash },
       }),
-    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
+    onSettled: () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: ['diff'] }),
+        qc.invalidateQueries({ queryKey: ['range-changes'] }),
+      ]),
   })
 
   const unviewAllMutation = useMutation({
     mutationFn: (files: { file: string; hash: string }[]) =>
       apiFetch('api/viewed-all', { method: 'DELETE', body: { files } }),
-    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
+    onSettled: () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: ['diff'] }),
+        qc.invalidateQueries({ queryKey: ['range-changes'] }),
+      ]),
   })
 
   const commentMutation = useMutation({
@@ -2068,7 +2413,14 @@ function DiffView() {
   }, [files])
 
   const openComposer = useCallback(
-    (file: string, side: Side, first: number, line: number, text?: SelectedText) => {
+    (
+      file: string,
+      side: Side,
+      first: number,
+      line: number,
+      text?: SelectedText,
+      structural?: StructuralAnchor,
+    ) => {
       const diff = files.find((f) => f.name === file)
       if (!diff) return
       commentMutation.reset()
@@ -2081,6 +2433,7 @@ function DiffView() {
         line,
         diff,
         text,
+        structural,
         opened: (prev?.opened ?? 0) + 1,
       }))
     },
@@ -2096,6 +2449,8 @@ function DiffView() {
     const fileDiff = files.find((f) => f.name === file)
     if (!fileDiff) return null
     if (fileDiff === diff) return composingState
+    if (composingState.structural)
+      return sameFileVersion(diff, fileDiff) ? composingState : null
     const moved = relocateLine(diff, fileDiff, side, line)
     const movedFirst = first === line ? moved : relocateLine(diff, fileDiff, side, first)
     if (moved === null || movedFirst === null) return null
@@ -2159,18 +2514,23 @@ function DiffView() {
   // Files whose viewed hash matches their current content, for the tree.
   const viewedFiles = useMemo(() => {
     const set = new Set<string>()
-    if (!data) return set
-    for (const [file, hash] of Object.entries(data.fileHashes)) {
+    if (!viewedFileHashes) return set
+    for (const [file, hash] of Object.entries(viewedFileHashes)) {
       if (viewed[file] === hash) set.add(file)
     }
     return set
-  }, [data, viewed])
+  }, [viewedFileHashes, viewed])
 
   const commentsEnabled = data?.commentsEnabled ?? false
   const send = data?.send ?? false
 
   const [showHelp, setShowHelp] = useState(false)
   const [showCommentsInfo, setShowCommentsInfo] = useState(false)
+  const [difftasticEnabled, setDifftasticEnabled] = useState(
+    () => new URLSearchParams(window.location.search).get('difftastic') === '1',
+  )
+  const difftasticPaneRef = useRef<HTMLDivElement>(null)
+  const difftastic = (data?.expandable ?? false) && difftasticEnabled
   const codeViewRef = useRef<CodeViewHandle<AnnotationMeta, undefined>>(null)
   // Clicking the gutter "+" leaves a line selection behind, and the library
   // pins the "+" to a selection. Clear it once the comment box closes, or the
@@ -2289,7 +2649,9 @@ function DiffView() {
         sentHere.push(`${s.id}@${line}`)
       }
       // A box on part of a line goes inside the line instead (see inlineBox)
-      const composingHere = composing?.file === name && !composing.text?.columns
+      const composingHere =
+        composing?.file === name &&
+        (!composing.text?.columns || (difftastic && composing.structural))
       if (composingHere) {
         annotations.push({
           side: composing.side,
@@ -2313,7 +2675,7 @@ function DiffView() {
         version,
       }
     })
-  }, [files, patchFiles, data, composing, sent, collapsed, commentsEnabled])
+  }, [files, patchFiles, data, composing, sent, collapsed, commentsEnabled, difftastic])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -2356,6 +2718,15 @@ function DiffView() {
   const anchorTargetRef = useRef<string | null>(null)
   const scrollItemToStart = useCallback(
     (id: string) => {
+      const pane = difftasticPaneRef.current
+      if (pane) {
+        const section = difftasticSection(pane, id)
+        if (section) {
+          markProgrammaticScroll()
+          pane.scrollTop = section.offsetTop
+        }
+        return
+      }
       const handle = codeViewRef.current
       if (!handle) return
       anchorTargetRef.current = id
@@ -2381,6 +2752,22 @@ function DiffView() {
     },
     [markProgrammaticScroll],
   )
+
+  const modeAnchorRef = useRef<string | null>(null)
+  const toggleDifftastic = () => {
+    modeAnchorRef.current = effectiveFocused
+    const enabled = !difftasticEnabled
+    const location = new URL(window.location.href)
+    if (enabled) location.searchParams.set('difftastic', '1')
+    else location.searchParams.delete('difftastic')
+    window.history.replaceState(window.history.state, '', location)
+    setDifftasticEnabled(enabled)
+  }
+  useLayoutEffect(() => {
+    const anchor = modeAnchorRef.current
+    modeAnchorRef.current = null
+    if (anchor) scrollItemToStart(anchor)
+  }, [difftastic, scrollItemToStart])
 
   // A click in the file tree: same move as n/p minus the line cursor. The
   // drawer would cover the file, so it closes.
@@ -2422,7 +2809,7 @@ function DiffView() {
     (item: CodeViewItem<AnnotationMeta>) => {
       if (item.type !== 'diff') return null
       const name = item.id
-      const hash = data?.fileHashes[name]
+      const hash = viewedFileHashes?.[name]
       const viewedHash = viewed[name]
       const isViewed = hash != null && viewedHash === hash
       const isStale = viewedHash != null && hash != null && viewedHash !== hash
@@ -2446,7 +2833,7 @@ function DiffView() {
           generated={data?.generated.includes(name) ?? false}
           collapsed={isCollapsed}
           focused={name === effectiveFocused}
-          showExpand={showExpand}
+          showExpand={!difftastic && showExpand}
           expandDisabledReason={expandDisabledReason}
           expanded={expandedFiles[name] ?? false}
           onToggleCollapse={() => {
@@ -2476,9 +2863,11 @@ function DiffView() {
     [
       data,
       viewed,
+      viewedFileHashes,
       collapsed,
       expandable,
       expandedFiles,
+      difftastic,
       markMutation,
       anchorIfTopFile,
       effectiveFocused,
@@ -2491,7 +2880,7 @@ function DiffView() {
   const renderComposer = useCallback(
     (fileDiff: FileDiffMetadata | null) => {
       if (!composing) return null
-      const { file, side, first, line, text: selected } = composing
+      const { file, side, first, line, text: selected, structural } = composing
       const columns = selected?.columns ?? null
       return (
         <CommentForm
@@ -2503,12 +2892,14 @@ function DiffView() {
           }}
           onSubmit={(text) => {
             const diff = composingRef.current?.diff
-            const lineText = diff && diffLineText(diff, 'additions', line)
+            const lineText =
+              structural?.lineText ?? (diff && diffLineText(diff, 'additions', line))
             if (lineText === undefined) return
             commentMutation.mutate({
               file,
               afterLine: line,
               lineText,
+              contentHash: structural?.contentHash,
               text,
               lineCount: line - first + 1,
               quote: (columns && selected?.quote) || undefined,
@@ -2523,7 +2914,11 @@ function DiffView() {
                     lines: [first, line],
                     columns,
                     quote: columns && selected ? selected.quote : null,
-                    code: fileDiff && lineContext(fileDiff, side, first, line),
+                    code: structural
+                      ? (structural.code ?? [
+                          { lines: [line, line], text: structural.lineText },
+                        ])
+                      : fileDiff && lineContext(fileDiff, side, first, line),
                     blob: fileDiff && sideBlob(fileDiff, side),
                     text,
                   })
@@ -2972,7 +3367,8 @@ function DiffView() {
           if (showHelp || composing || items.length === 0) break
           e.preventDefault()
           const inst = codeViewRef.current?.getInstance()
-          if (!inst) break
+          const structural = difftasticPaneRef.current
+          if (!inst && !structural) break
           const cur = currentIndex()
           let target: number
           if (e.key === 'n') {
@@ -2980,7 +3376,9 @@ function DiffView() {
             target = cur + 1
           } else {
             const curId = items[cur]!.id
-            const curTop = inst.getTopForItem(curId) ?? 0
+            const curTop = structural
+              ? (difftasticSection(structural, curId)?.offsetTop ?? 0)
+              : (inst?.getTopForItem(curId) ?? 0)
             // If scrolled into the body of the current file, snap to its top
             // first; otherwise step to the previous file. A scroll to the
             // current file's top that hasn't rendered yet (held-down p) counts
@@ -3000,7 +3398,7 @@ function DiffView() {
         }
         case 'j':
         case 'k': {
-          if (showHelp || composing || items.length === 0) break
+          if (difftastic || showHelp || composing || items.length === 0) break
           e.preventDefault()
           const down = e.key === 'j'
           const cur = cursorRef.current
@@ -3036,7 +3434,7 @@ function DiffView() {
           break
         }
         case 'c': {
-          if (!(commentsEnabled || send) || showHelp || composing) break
+          if (difftastic || !(commentsEnabled || send) || showHelp || composing) break
           e.preventDefault()
           const cur = cursorRef.current
           if (!cur || (collapsed[cur.file] ?? false)) break
@@ -3058,7 +3456,7 @@ function DiffView() {
           if (showHelp || composing || items.length === 0) break
           e.preventDefault()
           const name = items[currentIndex()]!.id
-          const hash = data?.fileHashes[name]
+          const hash = viewedFileHashes?.[name]
           if (!hash) break
           const mark = viewed[name] !== hash
           anchorIfTopFile(name)
@@ -3100,7 +3498,7 @@ function DiffView() {
           break
         }
         case 's': {
-          if (showHelp || composing) break
+          if (difftastic || showHelp || composing) break
           e.preventDefault()
           setSplitMode((prev) => {
             const next = SPLIT_CYCLE[(SPLIT_CYCLE.indexOf(prev) + 1) % SPLIT_CYCLE.length]!
@@ -3191,6 +3589,7 @@ function DiffView() {
     }
   }, [
     showHelp,
+    difftastic,
     showCommentsInfo,
     composing,
     files,
@@ -3199,6 +3598,7 @@ function DiffView() {
     items,
     data,
     viewed,
+    viewedFileHashes,
     markMutation,
     anchorIfTopFile,
     fileLines,
@@ -3232,7 +3632,15 @@ function DiffView() {
       </div>
     )
   if (error && !data)
-    return <pre style={{ color: 'red', padding: 20 }}>{String(error)}</pre>
+    return (
+      <div className="empty-diff">
+        <pre style={{ color: 'red' }}>{String(error)}</pre>
+        {REVIEW_REVISION_PARAMS.some((key) =>
+          new URLSearchParams(window.location.search).has(key),
+        ) && <RevisionPicker fetchGraph={fetchRevisionGraph} />}
+        <RangeChangeList fetchProgress={fetchRangeProgress} />
+      </div>
+    )
   if (isLoading || !data) return <div className="empty-diff">Loading...</div>
   if (data.error) return <pre style={{ color: 'red', padding: 20 }}>{data.error}</pre>
   if (!patch)
@@ -3244,12 +3652,29 @@ function DiffView() {
           </div>
         )}
         <div className="empty-diff">
-          <code>{data.revset}</code> is empty
+          {data.comparison ? (
+            'No changes between these revisions.'
+          ) : (
+            <>
+              <code>{data.revset}</code> is empty
+            </>
+          )}
+          {data.vcs === 'jj' && (
+            <RevisionPicker
+              fetchGraph={fetchRevisionGraph}
+              command={data.revset}
+              comparison={data.comparison}
+            />
+          )}
+          {data.vcs === 'jj' && (
+            <RangeChangeList
+              available={data.changeListAvailable}
+              fetchProgress={fetchRangeProgress}
+            />
+          )}
         </div>
       </>
     )
-
-  const { fileHashes } = data
 
   return (
     <>
@@ -3270,11 +3695,16 @@ function DiffView() {
             treeOpen={treeOpen}
             onToggleTree={toggleTree}
             command={data.revset}
-            fileHashes={fileHashes}
+            showRevisions={data.vcs === 'jj'}
+            comparison={data.comparison}
+            changeListAvailable={data.changeListAvailable}
+            fileHashes={viewedFileHashes ?? data.fileHashes}
             viewed={viewed}
             resolvedTheme={resolvedTheme}
             onToggleTheme={toggleTheme}
             onShowHelp={() => setShowHelp(true)}
+            difftastic={difftastic}
+            onToggleDifftastic={expandable ? toggleDifftastic : undefined}
             onUnviewAll={() => {
               const entries = Object.entries(viewed).map(([file, hash]) => ({ file, hash }))
               if (entries.length === 0) return
@@ -3336,16 +3766,60 @@ function DiffView() {
           {isNarrow && treeOpen && (
             <div className="file-tree-backdrop" onClick={() => setTreeOpen(false)} />
           )}
-          <CodeView
-            ref={codeViewRef}
-            className="codeview-root"
-            items={items}
-            options={options}
-            onScroll={onScroll}
-            renderCustomHeader={renderCustomHeader}
-            renderAnnotation={renderAnnotation}
-          />
-          {composing?.text?.columns &&
+          {difftastic ? (
+            <div
+              className="codeview-root difftastic-pane"
+              ref={difftasticPaneRef}
+              tabIndex={0}
+              role="region"
+              aria-label="Difftastic changes"
+              onScroll={(event) => {
+                const pane = event.currentTarget
+                scrollTopRef.current = pane.scrollTop
+                if (!programmaticScrollRef.current)
+                  setFocused(topDifftasticFile(pane) ?? null)
+              }}
+            >
+              {items.map((item) => (
+                <section key={item.id} data-difftastic-file={item.id}>
+                  {renderCustomHeader(item)}
+                  {!item.collapsed &&
+                    (item.fileDiff.hunks.length > 0 ? (
+                      <DifftasticDiff
+                        item={item}
+                        patchHash={data.patchHash}
+                        commentsEnabled={commentsEnabled}
+                        send={send}
+                        onComment={(line, anchor, first = line.number, text) => {
+                          if (text && composingRef.current && draftRef.current.trim())
+                            return
+                          openComposer(item.id, line.side, first, line.number, text, anchor)
+                        }}
+                        renderAnnotation={(annotation) =>
+                          renderAnnotation(annotation, null, item)
+                        }
+                      />
+                    ) : (
+                      <p className="difftastic-notice">
+                        {fileNotice(item.fileDiff) ?? 'No text changes to compare.'}
+                      </p>
+                    ))}
+                </section>
+              ))}
+            </div>
+          ) : (
+            <CodeView
+              ref={codeViewRef}
+              className="codeview-root"
+              items={items}
+              options={options}
+              onScroll={onScroll}
+              renderCustomHeader={renderCustomHeader}
+              renderAnnotation={renderAnnotation}
+            />
+          )}
+          {!difftastic &&
+            composing?.text?.columns &&
             createPortal(
               renderComposer(
                 items.find((it) => it.id === composing.file)?.fileDiff ?? null,
@@ -3372,24 +3846,28 @@ const poolOptions = {
 }
 const highlighterOptions = { theme: DIFF_THEME, preferredHighlighter: HIGHLIGHTER }
 
-export function App() {
-  const app = (
-    <Tooltip.Provider>
-      <DiffView />
-    </Tooltip.Provider>
-  )
+function Review() {
+  const [queryClient] = useState(() => new QueryClient(queryClientOptions))
   return (
     <QueryClientProvider client={queryClient}>
-      {HIGHLIGHTER === 'highlights' ? (
-        app
-      ) : (
-        <WorkerPoolContextProvider
-          poolOptions={poolOptions}
-          highlighterOptions={highlighterOptions}
-        >
-          {app}
-        </WorkerPoolContextProvider>
-      )}
+      <Tooltip.Provider>
+        <DiffView />
+      </Tooltip.Provider>
     </QueryClientProvider>
+  )
+}
+
+export function App() {
+  const key = useSyncExternalStore(subscribeToReviewLocation, reviewLocationKey)
+  const review = <Review key={key} />
+  return HIGHLIGHTER === 'highlights' ? (
+    review
+  ) : (
+    <WorkerPoolContextProvider
+      poolOptions={poolOptions}
+      highlighterOptions={highlighterOptions}
+    >
+      {review}
+    </WorkerPoolContextProvider>
   )
 }

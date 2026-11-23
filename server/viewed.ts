@@ -29,12 +29,13 @@
  */
 
 import { join } from 'path'
-import { createHash } from 'crypto'
-import { mkdir, readFile, writeFile } from 'fs/promises'
+import { createHash, randomUUID } from 'crypto'
+import { mkdir, readFile, rename, unlink, writeFile } from 'fs/promises'
 import type { ViewedMap } from '../shared/types.ts'
 
 const BASE_DIR = join(process.env['HOME'] ?? '~', '.local', 'share', 'skepsis')
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+const pendingWrites = new Map<string, Promise<void>>()
 
 interface Entry {
   hash: string
@@ -77,7 +78,14 @@ async function saveAll(cwd: string, map: Map<string, Entry[]>): Promise<void> {
       lines.push(`${file}\t${hash}\t${timestamp}`)
     }
   }
-  await writeFile(viewedPath(cwd), lines.join('\n') + '\n')
+  const path = viewedPath(cwd)
+  const temp = path + '.' + randomUUID()
+  try {
+    await writeFile(temp, lines.join('\n') + '\n')
+    await rename(temp, path)
+  } finally {
+    await unlink(temp).catch(() => {})
+  }
 }
 
 /**
@@ -89,7 +97,12 @@ export async function loadViewed(
   cwd: string,
   fileHashes: Record<string, string>,
 ): Promise<ViewedMap> {
+  await pendingWrites.get(cwd)?.catch(() => {})
   const all = await loadAll(cwd)
+  return matchViewed(all, fileHashes)
+}
+
+function matchViewed(all: Map<string, Entry[]>, fileHashes: ViewedMap): ViewedMap {
   const viewed: ViewedMap = {}
   for (const [file, hash] of Object.entries(fileHashes)) {
     if (all.get(file)?.some((e) => e.hash === hash)) {
@@ -99,17 +112,44 @@ export async function loadViewed(
   return viewed
 }
 
-export async function markViewed(cwd: string, file: string, hash: string): Promise<void> {
+export async function countViewed(
+  cwd: string,
+  filesByChange: ViewedMap[],
+): Promise<number[]> {
+  await pendingWrites.get(cwd)?.catch(() => {})
   const all = await loadAll(cwd)
-  const entries = all.get(file) ?? []
-  const existing = entries.find((e) => e.hash === hash)
-  if (existing) {
-    existing.timestamp = Date.now()
-  } else {
-    entries.push({ hash, timestamp: Date.now() })
-    all.set(file, entries)
-  }
-  await saveAll(cwd, all)
+  return filesByChange.map((files) => Object.keys(matchViewed(all, files)).length)
+}
+
+function updateViewed(
+  cwd: string,
+  update: (all: Map<string, Entry[]>) => void,
+): Promise<void> {
+  const previous = pendingWrites.get(cwd) ?? Promise.resolve()
+  const write = previous
+    .catch(() => {})
+    .then(async () => {
+      const all = await loadAll(cwd)
+      update(all)
+      await saveAll(cwd, all)
+    })
+  pendingWrites.set(cwd, write)
+  return write.finally(() => {
+    if (pendingWrites.get(cwd) === write) pendingWrites.delete(cwd)
+  })
+}
+
+export function markViewed(cwd: string, file: string, hash: string): Promise<void> {
+  return updateViewed(cwd, (all) => {
+    const entries = all.get(file) ?? []
+    const existing = entries.find((e) => e.hash === hash)
+    if (existing) {
+      existing.timestamp = Date.now()
+    } else {
+      entries.push({ hash, timestamp: Date.now() })
+      all.set(file, entries)
+    }
+  })
 }
 
 export async function unmarkViewed(cwd: string, file: string, hash: string): Promise<void> {
@@ -118,17 +158,17 @@ export async function unmarkViewed(cwd: string, file: string, hash: string): Pro
 
 /** Unmark several files in one read-modify-write pass so concurrent
  *  per-file deletes can't clobber each other's saves. */
-export async function unmarkViewedAll(
+export function unmarkViewedAll(
   cwd: string,
   files: { file: string; hash: string }[],
 ): Promise<void> {
-  const all = await loadAll(cwd)
-  for (const { file, hash } of files) {
-    const entries = all.get(file)
-    if (!entries) continue
-    const filtered = entries.filter((e) => e.hash !== hash)
-    if (filtered.length === 0) all.delete(file)
-    else all.set(file, filtered)
-  }
-  await saveAll(cwd, all)
+  return updateViewed(cwd, (all) => {
+    for (const { file, hash } of files) {
+      const entries = all.get(file)
+      if (!entries) continue
+      const filtered = entries.filter((e) => e.hash !== hash)
+      if (filtered.length === 0) all.delete(file)
+      else all.set(file, filtered)
+    }
+  })
 }
