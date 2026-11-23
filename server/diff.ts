@@ -162,7 +162,11 @@ export function patchHash(patch: string): string {
  * change to a file changed, so keying on the new blob would mark the file
  * viewed in the commit's own diff too, where most of it is unseen.
  */
-export function extractFileHashes(patch: string, interdiff = false): FileHashes {
+export function extractFileHashes(
+  patch: string,
+  wholeBlock = false,
+  scope = '',
+): FileHashes {
   const hashes: FileHashes = {}
   let currentFile: string | null = null
   let block: string[] = []
@@ -170,6 +174,7 @@ export function extractFileHashes(patch: string, interdiff = false): FileHashes 
   const hashBlock = () => {
     if (currentFile == null) return
     hashes[currentFile] = createHash('sha1')
+      .update(scope)
       .update(block.join('\n'))
       .digest('hex')
       .slice(0, 12)
@@ -184,7 +189,7 @@ export function extractFileHashes(patch: string, interdiff = false): FileHashes 
       continue
     }
     if (currentFile == null) continue
-    if (line.startsWith('index ') && !interdiff) {
+    if (line.startsWith('index ') && !wholeBlock) {
       const indexMatch = line.match(/^index [0-9a-f]+\.\.([0-9a-f]+)/)
       if (indexMatch) {
         hashes[currentFile] = indexMatch[1]!
@@ -197,4 +202,8 @@ export function extractFileHashes(patch: string, interdiff = false): FileHashes 
   hashBlock()
 
   return hashes
+}
+
+export function changeFileHashes(patch: string, change: string): FileHashes {
+  return extractFileHashes(patch, true, change)
 }

@@ -45,6 +45,7 @@ const program = new Command()
   .name('skepsis')
   .description('Local diff review UI (auto-detects jj or git)')
   .option('-r, --revisions <revsets>', 'Show changes in these revisions')
+  .option('--revset <revset>', 'Filter the Jujutsu revision graph')
   .option('-f, --from <rev>', 'Show changes from this revision')
   .option('-t, --to <rev>', 'Show changes to this revision')
   .option(
@@ -127,6 +128,7 @@ try {
 } catch (err) {
   fail((err as Error).message)
 }
+if (opts.revset && diffSource.vcs !== 'jj') fail('--revset needs jj')
 
 const children: ReturnType<typeof spawn>[] = []
 
@@ -172,6 +174,7 @@ const { port: apiPort, token } = await startServer({
   poll: opts.poll,
   send,
   tabSize: opts.tabSize,
+  graphRevset: opts.revset,
 }).catch((err: Error) => {
   console.error(err.message)
   return cleanup(1)

@@ -12,9 +12,10 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { zValidator } from '@hono/zod-validator'
 import { basename, join } from 'node:path'
 import type { DiffArgs } from '../shared/types.ts'
-import { getDiff, patchHash } from './diff.ts'
+import { changeFileHashes, getDiff, patchHash } from './diff.ts'
 import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
+import { difftasticPresentation, renderDifftastic } from './difftastic.ts'
 import { getGeneratedFiles } from './generated.ts'
 import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.ts'
 import { insertComment, removeComment } from './comment.ts'
@@ -24,12 +25,22 @@ import { newToken, sendGate, tokenMatches } from './gate.ts'
 import { buildPayload } from './send.ts'
 import type { SendPayload, SendResult } from './send.ts'
 import {
+  changeReviewId,
+  currentComparison,
+  DEFAULT_GRAPH_REVSET,
+  revisionGraph,
+  rangeReviewProgress,
+  reviewRange,
+  selectReview,
+} from './revisions.ts'
+import {
   viewedRequestSchema,
   viewedDeleteSchema,
   viewedDeleteAllSchema,
   commentRequestSchema,
   commentDeleteSchema,
   sendRequestSchema,
+  difftasticQuerySchema,
   fileContentsQuerySchema,
   themeRequestSchema,
   DEFAULT_TAB_SIZE,
@@ -59,6 +70,8 @@ export interface BuildOptions {
   guard?: boolean
   /** Tab width in columns (default: DEFAULT_TAB_SIZE) */
   tabSize?: number
+  /** Initial Jujutsu graph filter. */
+  graphRevset?: string
 }
 
 /** A fetch handler for the page and its API, rooted at `/` */
@@ -72,8 +85,17 @@ export interface App {
 /** The page and its API for one diff. Runs the diff once and rejects if it
  *  fails. */
 export async function buildApp(opts: BuildOptions): Promise<App> {
+  return buildReviewApp(opts, opts.guard === false ? null : newToken(), true)
+}
+
+async function buildReviewApp(
+  opts: BuildOptions,
+  token: string | null,
+  routeSelections: boolean,
+): Promise<App> {
   const { diffSource, cwd, poll = true, send, guard = true } = opts
   const { tabSize = DEFAULT_TAB_SIZE } = opts
+  let difftasticSettings: ReturnType<typeof difftasticPresentation> | undefined
   // The paths in the latest diff, including the old names of renames. A
   // request's path is joined onto the repo directory, so the routes that read
   // or write files only take one of these: `../` could otherwise reach
@@ -94,12 +116,11 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
       throw new HTTPException(400, { message: `Not a file in this diff: ${file}` })
   }
 
-  // Fail fast on bad args by running the exact diff command we'll serve.
-  // /api/diff re-runs it per request to stay fresh.
-  await runDiff()
+  // Validate the command at server startup. A selection made in the browser
+  // is validated by its first diff request.
+  if (routeSelections) await runDiff()
 
   const app = new Hono()
-  const token = guard ? newToken() : null
 
   // Every API call must carry the token (see tokenMatches). The theme boot
   // script is the exception: a <script src> can't send a header, and all it
@@ -120,28 +141,69 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
     )
   })
 
+  if (routeSelections && diffSource.vcs === 'jj') {
+    const selections = new Map<string, Promise<App>>()
+    app.get('/api/revisions', async (c) => {
+      const revset =
+        c.req.query('revset')?.trim() || opts.graphRevset || DEFAULT_GRAPH_REVSET
+      return c.json(await revisionGraph(cwd, revset))
+    })
+    app.use('/api/*', async (c, next) => {
+      const selected = selectReview(new URL(c.req.url).searchParams, diffSource, cwd)
+      if (!selected) return next()
+      let review = selections.get(selected.key)
+      if (!review) {
+        if (selections.size >= 12) selections.delete(selections.keys().next().value!)
+        review = buildReviewApp({ ...opts, diffSource: selected.diffSource }, token, false)
+        selections.set(selected.key, review)
+      }
+      try {
+        return (await review).fetch(c.req.raw)
+      } catch (cause) {
+        if (selections.get(selected.key) === review) selections.delete(selected.key)
+        throw new HTTPException(400, {
+          message:
+            cause instanceof Error ? cause.message : 'Could not load this comparison.',
+          cause,
+        })
+      }
+    })
+  }
+
   // An interdiff that ends at the working copy still can't take comments: a
   // changed description shows as a file named JJ-COMMIT-DESCRIPTION, which a
   // comment would create on disk.
   const commentsEnabled = diffSource.toWorkingCopy && !diffSource.interdiff
 
   app.get('/api/diff', async (c) => {
-    const { patch, fileHashes } = await runDiff()
+    const diff = await runDiff().catch((cause: unknown) => {
+      if (routeSelections) throw cause
+      throw new HTTPException(400, {
+        message: cause instanceof Error ? cause.message : 'Could not load this comparison.',
+        cause,
+      })
+    })
+    const changeId = routeSelections ? undefined : await changeReviewId(cwd, diffSource)
+    const { patch, fileHashes } = diff
+    const reviewHashes = changeId ? changeFileHashes(patch, changeId) : undefined
     const files = Object.keys(fileHashes)
     const [viewed, generated, commentSyntaxes] = await Promise.all([
-      loadViewed(cwd, fileHashes),
+      loadViewed(cwd, reviewHashes ?? fileHashes),
       getGeneratedFiles(cwd, files),
       commentsEnabled ? getCommentSyntaxes(cwd, files) : {},
     ])
     return c.json({
       patch,
       revset: displayCommand(diffSource),
+      comparison: currentComparison(diffSource),
+      changeListAvailable: !!reviewRange(diffSource),
       repo: basename(cwd),
       vcs: diffSource.vcs,
       interdiff: !!diffSource.interdiff,
       commentsEnabled,
       expandable: diffSource.endpoints !== null,
       fileHashes,
+      reviewHashes,
       patchHash: patchHash(patch),
       poll,
       send: !!send,
@@ -151,6 +213,10 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
       generated,
     } satisfies DiffResponse)
   })
+
+  app.get('/api/range-changes', async (c) =>
+    c.json(await rangeReviewProgress(cwd, diffSource)),
+  )
 
   // Polled every few seconds while the page is visible. Requests that arrive
   // while a diff is running share its result rather than starting another, so
@@ -181,6 +247,50 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
     return c.json(contents satisfies FileContentsResponse)
   })
 
+  app.get('/api/difftastic', zValidator('query', difftasticQuerySchema), async (c) => {
+    const { path, oldPath, full } = c.req.valid('query')
+    if (!diffSource.endpoints) {
+      throw new HTTPException(422, { message: 'Difftastic needs two file revisions.' })
+    }
+    await requireInDiff(path)
+    if (oldPath) await requireInDiff(oldPath)
+    const contents = await getFileContents(diffSource, cwd, path, oldPath)
+    if (contents.oldContents === null && contents.newContents === null) {
+      throw new HTTPException(422, {
+        message: 'Could not read either version of the file.',
+      })
+    }
+    if (contents.oldContents?.includes('\0') || contents.newContents?.includes('\0')) {
+      throw new HTTPException(422, { message: 'Difftastic previews require text files.' })
+    }
+    try {
+      const presentation = await (difftasticSettings ??= difftasticPresentation(
+        cwd,
+        diffSource.vcs === 'jj',
+      ))
+      return c.json(
+        await renderDifftastic(
+          path,
+          contents,
+          c.req.raw.signal,
+          full === '1',
+          presentation,
+        ),
+      )
+    } catch (cause) {
+      if (cause instanceof Error && 'code' in cause && cause.code === 'ENOENT') {
+        throw new HTTPException(503, {
+          message: 'Difftastic (difft) was not found on the server PATH.',
+          cause,
+        })
+      }
+      throw new HTTPException(502, {
+        message: 'Difftastic could not complete this comparison.',
+        cause,
+      })
+    }
+  })
+
   app.post('/api/viewed', zValidator('json', viewedRequestSchema), async (c) => {
     const { file, hash } = c.req.valid('json')
     await markViewed(cwd, file, hash)
@@ -200,9 +310,12 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
   })
 
   app.post('/api/comment', zValidator('json', commentRequestSchema), async (c) => {
-    const { file, afterLine, lineText, text, lineCount, quote } = c.req.valid('json')
+    if (!commentsEnabled)
+      throw new HTTPException(403, { message: 'Comments require the working copy.' })
+    const { file, afterLine, lineText, text, lineCount, quote, contentHash } =
+      c.req.valid('json')
     await requireInDiff(file)
-    await insertComment(cwd, file, afterLine, lineText, text, lineCount, quote)
+    await insertComment(cwd, file, afterLine, lineText, text, lineCount, quote, contentHash)
     hashInFlight = null
     return c.json({ ok: true } satisfies OkResponse)
   })
@@ -240,6 +353,8 @@ export async function buildApp(opts: BuildOptions): Promise<App> {
   }
 
   app.delete('/api/comment', zValidator('json', commentDeleteSchema), async (c) => {
+    if (!commentsEnabled)
+      throw new HTTPException(403, { message: 'Comments require the working copy.' })
     const { file, line } = c.req.valid('json')
     await requireInDiff(file)
     await removeComment(cwd, file, line)

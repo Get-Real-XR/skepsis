@@ -29,13 +29,70 @@ function tryRun(cmd: string, args: string[], cwd: string): Promise<string | null
   })
 }
 
-/** Fetch a file's contents at the diff's left revision. */
-function fetchOld(src: DiffArgs, oldPath: string, cwd: string): Promise<string | null> {
-  if (!src.endpoints) return Promise.resolve(null)
-  const { left } = src.endpoints
-  return src.vcs === 'jj'
-    ? tryRun('jj', ['file', 'show', '-r', left, '--', oldPath], cwd)
-    : tryRun('git', ['show', `${left}:${oldPath}`], cwd)
+// Jujutsu exports the merged parent tree as the left side for external tools.
+const READ_JJ_DIFF_BASE = `
+  const fs = require('node:fs')
+  const { join } = require('node:path')
+  const file = join(process.argv[1], Buffer.from(process.argv[2], 'base64').toString())
+  let contents = null
+  try {
+    const stat = fs.lstatSync(file)
+    if (stat.isSymbolicLink()) contents = fs.readlinkSync(file)
+    if (stat.isFile()) contents = fs.readFileSync(file, 'utf8')
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  process.stdout.write(JSON.stringify(contents))
+`
+
+/** Fetch a file's contents on the left side of the diff. */
+async function fetchOld(
+  src: DiffArgs,
+  path: string,
+  oldPath: string,
+  cwd: string,
+): Promise<string | null> {
+  if (!src.endpoints) return null
+  const { left, right } = src.endpoints
+  if (src.vcs === 'git') return tryRun('git', ['show', `${left}:${oldPath}`], cwd)
+  const contents = await tryRun('jj', ['file', 'show', '-r', left, '--', oldPath], cwd)
+  if (
+    contents !== null ||
+    right === 'workingCopy' ||
+    src.args[0] !== '-r' ||
+    left !== `${right.rev}-`
+  )
+    return contents
+
+  const parents = await tryRun(
+    'jj',
+    ['log', '--no-graph', '--limit=2', '-r', left, '-T', '"x"'],
+    cwd,
+  )
+  if (parents !== 'xx') return null
+  const tool = 'skepsis-file-contents'
+  const prefix = `merge-tools.${tool}.`
+  const args = ['-e', READ_JJ_DIFF_BASE, '$left', Buffer.from(oldPath).toString('base64')]
+  const merged = await tryRun(
+    'jj',
+    [
+      'diff',
+      '-r',
+      right.rev,
+      '--tool',
+      tool,
+      '--config',
+      prefix + 'program=' + JSON.stringify(process.execPath),
+      '--config',
+      prefix + 'diff-invocation-mode="dir"',
+      '--config',
+      prefix + 'diff-args=' + JSON.stringify(args),
+      '--',
+      ...[...new Set([path, oldPath])].map((name) => 'file:' + JSON.stringify(name)),
+    ],
+    cwd,
+  )
+  return merged?.length ? (JSON.parse(merged) as string | null) : null
 }
 
 /** Fetch a file's contents at the diff's right (new) endpoint. */
@@ -67,7 +124,7 @@ export async function getFileContents(
   oldPath?: string,
 ): Promise<FileContentsResponse> {
   const [oldContents, newContents] = await Promise.all([
-    fetchOld(src, oldPath ?? path, cwd),
+    fetchOld(src, path, oldPath ?? path, cwd),
     fetchNew(src, path, cwd),
   ])
   return { oldContents, newContents }

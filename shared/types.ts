@@ -31,6 +31,11 @@ export const commentRequestSchema = z.object({
   /** What the page shows at afterLine, so a file that changed since the diff
    *  loaded can't take the comment on the wrong line. */
   lineText: z.string(),
+  /** Full working-copy content hash for a structural line anchor. */
+  contentHash: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
   text: z.string(),
   /** How many lines the comment covers, ending at afterLine. */
   lineCount: z.number().int().min(1).optional(),
@@ -79,6 +84,10 @@ export const fileContentsQuerySchema = z.object({
   path: z.string(),
   // Present for renamed files: the path to fetch the old-side content from.
   oldPath: z.string().optional(),
+})
+
+export const difftasticQuerySchema = fileContentsQuerySchema.extend({
+  full: z.literal('1').optional(),
 })
 
 // --- Request types (inferred from schemas) ---
@@ -141,9 +150,47 @@ export type DiffArgs = ({ vcs: 'jj'; args: string[] } | { vcs: 'git'; args: stri
 export type ViewedMap = Record<string, string>
 export type FileHashes = Record<string, string>
 
+export const REVIEW_REVISION_PARAMS = ['viewChange', 'viewFrom', 'viewTo'] as const
+
+export interface RevisionComparison {
+  from: string
+  to: string
+}
+
+export interface ChangeReviewProgress {
+  commit: string
+  change: string
+  description: string
+  workingCopy: boolean
+  viewed: number
+  files: number
+}
+
+export interface RangeReviewProgress {
+  fromOnly: ChangeReviewProgress[]
+  toOnly: ChangeReviewProgress[]
+}
+
+export interface RevisionNode {
+  commit: string
+  change: string
+  parents: string[]
+  description: string
+  bookmarks: string[]
+  workingCopy: boolean
+}
+
+export interface RevisionGraph {
+  revset: string
+  nodes: RevisionNode[]
+  truncated: boolean
+}
+
 export interface DiffResponse {
   patch: string
   revset: string
+  comparison?: RevisionComparison
+  changeListAvailable?: boolean
   /** The name of the directory skepsis runs in, for the page title */
   repo: string
   vcs: 'jj' | 'git'
@@ -155,6 +202,8 @@ export interface DiffResponse {
    *  file contents for hunk expansion. */
   expandable: boolean
   fileHashes: FileHashes
+  /** Per-file fingerprints for viewed state when reviewing a single change. */
+  reviewHashes?: FileHashes
   /** Hash of `patch`, compared against /api/diff-hash to notice changes. */
   patchHash: string
   /** Whether the page should poll /api/diff-hash (off with --no-poll). */
@@ -181,6 +230,28 @@ export interface DiffResponse {
 export interface FileContentsResponse {
   oldContents: string | null
   newContents: string | null
+}
+
+export type DifftasticLine = {
+  kind: 'context' | 'addition' | 'deletion'
+  side: 'additions' | 'deletions'
+  number: number
+  text: string
+  /** Token offsets in UTF-16 code units. */
+  changes: { start: number; end: number }[]
+}
+
+export interface DifftasticResponse {
+  language: string
+  lines: DifftasticLine[]
+  sections: {
+    layout: 'inline' | 'old' | 'new' | 'split'
+    rows: { old: number | null; new: number | null }[]
+  }[]
+  tabWidth: number
+  hasHiddenLines: boolean
+  unchanged: boolean
+  newContentHash: string | null
 }
 
 export interface ErrorResponse {

@@ -24,6 +24,7 @@ vi.mock('./diff.ts', async (importOriginal) => ({
 
 // See main.test.ts: HOME must be isolated before main.ts loads.
 const home = await isolateVcsConfig()
+const { buildApp } = await import('./app.ts')
 const { startServer } = await import('./main.ts')
 const { patchHash } = await import('./diff.ts')
 
@@ -34,9 +35,9 @@ afterAll(async () => {
 const diffSource: DiffArgs = {
   vcs: 'git',
   args: ['HEAD'],
-  toWorkingCopy: false,
+  toWorkingCopy: true,
   files: [],
-  endpoints: null,
+  endpoints: { left: 'HEAD', right: 'workingCopy' },
 }
 
 // a.ts is the file the comment test writes to, which has to be in the diff
@@ -69,6 +70,27 @@ const hashOf = async (res: Promise<Response>) =>
 
 beforeEach(() => {
   getDiff.mockReset()
+})
+
+it('runs one diff on the first request for a selected revision', async () => {
+  getDiff.mockResolvedValueOnce(result('startup')).mockResolvedValueOnce(result('selected'))
+  const app = await buildApp({
+    cwd: process.cwd(),
+    diffSource: {
+      vcs: 'jj',
+      args: ['-r', '@'],
+      toWorkingCopy: true,
+      files: [],
+      endpoints: null,
+    },
+    guard: false,
+  })
+  const response = await app.fetch(
+    new Request('http://localhost/api/diff?viewChange=' + '1'.repeat(40)),
+  )
+  expect(response.status).toBe(200)
+  expect(await response.json()).toMatchObject({ patch: 'selected' })
+  expect(getDiff).toHaveBeenCalledTimes(2)
 })
 
 describe('patchHash', () => {
